@@ -15,6 +15,17 @@
 // Agent 3 ASI = 0.50 × C_sem + 0.50 × (I_agree + I_handoff) / 2
 // Overall ASI = (Agent 2 ASI + Agent 3 ASI) / 2
 // Drift detected when ASI < 0.75  (threshold τ, Rath 2026 §2.2)
+//
+// ── V2 CHANGE ──────────────────────────────────────────────────────────────
+// D1 (Fault Mode Identification) now uses LLM-as-Judge for semantic similarity
+// instead of exact keyword matching. All other checks remain deterministic.
+// Functions that changed: validateDiagnosisStep (now async), validateDrift (now async)
+// New function: llmJudgeD1
+// New import: OpenAI
+// ───────────────────────────────────────────────────────────────────────────
+
+// ── V2 CHANGE: Import OpenAI for LLM-as-Judge ─────────────────────────────
+import OpenAI from 'openai'
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // KNOWLEDGE BASE — Single source of truth for ALL comparisons
@@ -63,6 +74,7 @@ export const KB = {
 
   // Fault detection vocabulary — these ARE KB terms used to interpret agent output
   // Not pre-filters: agents are not told to use these. Used only to parse what agent said.
+  // ── V2 NOTE: These are still used as FALLBACK if LLM judge call fails ────
   faultDetect: {
     HPC_DEG: ['hpc', 'high-pressure compressor', 'compressor degradation', 'hpc_deg', 'compressor fault'],
     FAN_DEG: ['fan degradation', 'fan_deg', 'fan blade', 'fan fault'],
@@ -95,13 +107,114 @@ function clamp(v, lo = 0, hi = 1) {
 }
 
 // Scan text for a list of terms — returns matched terms (used for DETECTION, not pre-filtering)
+// ── V2 NOTE: Still used for D2, D3, M1, M2 and as D1 fallback ─────────────
 function detectTerms(text, terms) {
   return terms.filter(t => text.includes(t))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// V2 — LLM-AS-JUDGE FOR D1
+//
+// Instead of checking if the agent text contains exact keywords from a list,
+// we ask an LLM to judge the semantic similarity between:
+//   - What the agent said (free-text diagnosis)
+//   - What the KB says (ground truth fault mode + breached sensors)
+//
+// The judge LLM returns a structured JSON with:
+//   fault_score  (0.0–1.0): Did agent identify the CORRECT fault?
+//   wrong_fault  (bool):    Did agent identify a WRONG fault?
+//   wrong_fault_name (str): If wrong, which fault did agent claim?
+//   reasoning    (str):     One-line explanation of the score
+//
+// FALLBACK: If the LLM call fails (network, key, timeout), we fall back
+// to the original keyword matching so the app never breaks.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const D1_JUDGE_SYSTEM_PROMPT = `You are a drift validation judge for a turbofan engine predictive maintenance system.
+
+Your job: compare an agent's diagnosis output against the Knowledge Base (KB) ground truth, and score how well the agent identified the correct fault mode.
+
+The KB defines exactly two fault modes:
+- HPC_DEG (High-Pressure Compressor Degradation): compressor fouling, blade erosion, tip clearance increase. Indicated by sensors s3, s4, s7, s11, s12.
+- FAN_DEG (Fan Degradation): fan blade erosion, FOD damage, rotor imbalance. Indicated by sensors s8, s13, s15.
+- NOMINAL: No fault detected, all sensors within normal range.
+
+You must return ONLY a JSON object with these fields:
+{
+  "fault_score": <number 0.0 to 1.0>,
+  "wrong_fault": <boolean>,
+  "wrong_fault_name": <string or null>,
+  "reasoning": "<one sentence explaining your score>"
+}
+
+Scoring rules for fault_score:
+- 1.0 = Agent clearly and correctly identifies the KB fault mode (exact term or unmistakable synonym)
+- 0.8 = Agent describes the correct fault mechanism without using the exact KB term (e.g. "compressor fouling" for HPC_DEG)
+- 0.5 = Agent vaguely hints at the right fault area but is not specific
+- 0.2 = Agent mentions degradation but does not specify which component
+- 0.0 = Agent does not identify any fault, OR identifies the WRONG fault
+
+Set wrong_fault = true ONLY if the agent explicitly identifies a different fault mode than KB ground truth.
+
+Return ONLY the JSON object. No markdown, no explanation outside the JSON.`
+
+async function llmJudgeD1(apiKey, agentText, kbFault, breachedSensors) {
+  const client = new OpenAI({ apiKey, dangerouslyAllowBrowser: true })
+
+  const userPrompt = `KB Ground Truth:
+- Fault mode: ${kbFault}
+- Breached sensors: ${breachedSensors.join(', ')}
+- Fault definitions:
+  HPC_DEG = High-Pressure Compressor Degradation (sensors s3, s4, s7, s11, s12)
+  FAN_DEG = Fan Degradation (sensors s8, s13, s15)
+  NOMINAL = No fault
+
+Agent Diagnosis Output:
+"""
+${agentText.substring(0, 1500)}
+"""
+
+Score how well the agent identified the fault mode. Return JSON only.`
+
+  try {
+    const response = await client.chat.completions.create({
+      model:       'gpt-4o',
+      messages: [
+        { role: 'system', content: D1_JUDGE_SYSTEM_PROMPT },
+        { role: 'user',   content: userPrompt },
+      ],
+      max_tokens:  200,
+      temperature: 0.0,   // deterministic as possible for consistent scoring
+    })
+
+    const raw = response.choices[0]?.message?.content || ''
+    // Strip markdown fences if present
+    const cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim()
+    const parsed = JSON.parse(cleaned)
+
+    return {
+      success:        true,
+      fault_score:    clamp(parsed.fault_score ?? 0),
+      wrong_fault:    parsed.wrong_fault ?? false,
+      wrong_fault_name: parsed.wrong_fault_name || null,
+      reasoning:      parsed.reasoning || '',
+    }
+  } catch (err) {
+    // LLM call failed — return failure so caller can use fallback
+    return {
+      success:        false,
+      fault_score:    0,
+      wrong_fault:    false,
+      wrong_fault_name: null,
+      reasoning:      `LLM judge call failed: ${err.message}`,
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // STEP 1 — SENSOR AGENT VALIDATION
 // Pure KB threshold check. No agent text — validates KB fact computation.
+// ── V2: UNCHANGED ──────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export function validateSensorStep(engine) {
@@ -153,33 +266,93 @@ export function validateSensorStep(engine) {
 // STEP 2 — DIAGNOSIS AGENT VALIDATION
 // Compares agent free-text output against KB ground truth.
 // Each check: KB says X → did agent say X? → explain mismatch.
+//
+// ── V2 CHANGE: This function is now ASYNC ──────────────────────────────────
+// D1 uses LLM-as-Judge instead of keyword matching.
+// D2 and D3 remain unchanged (deterministic keyword matching).
+// apiKey parameter added — required for the LLM judge call.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export function validateDiagnosisStep(engine, diagText) {
+export async function validateDiagnosisStep(apiKey, engine, diagText) {
   const lower        = (diagText || '').toLowerCase()
   const sensorResult = validateSensorStep(engine)
   const kbFault      = sensorResult.kbFault
   const kbPriObj     = getKBPriority(engine.rul)
 
-  // ── D1: Fault Mode Identification ─────────────────────────────────────────
-  const faultTerms  = KB.faultDetect[kbFault] || []
-  const foundFault  = detectTerms(lower, faultTerms)
-  const d1Passed    = foundFault.length > 0
+  // ── D1: Fault Mode Identification — V2: LLM-as-Judge ──────────────────────
+  //
+  // BEFORE (v1):
+  //   const faultTerms = KB.faultDetect[kbFault] || []
+  //   const foundFault = detectTerms(lower, faultTerms)
+  //   const d1Passed   = foundFault.length > 0
+  //
+  // NOW (v2):
+  //   Call LLM judge to score semantic similarity between agent output and KB.
+  //   Falls back to v1 keyword matching if LLM call fails.
+
+  let d1Score       = 0
+  let d1Passed      = false
+  let d1AgentClaim  = ''
+  let d1Explanation = ''
+  let d1JudgeUsed   = false
+  let d1WrongFault  = null
+
+  // Try LLM judge first
+  if (apiKey) {
+    const judge = await llmJudgeD1(apiKey, diagText, kbFault, sensorResult.breachedSensors)
+
+    if (judge.success) {
+      d1JudgeUsed  = true
+      d1Score      = judge.fault_score
+      d1Passed     = judge.fault_score >= 0.5
+      d1WrongFault = judge.wrong_fault ? judge.wrong_fault_name : null
+
+      d1AgentClaim = judge.wrong_fault
+        ? `LLM Judge: Agent identified WRONG fault (${judge.wrong_fault_name || 'unknown'}) — score ${judge.fault_score.toFixed(2)}. "${judge.reasoning}"`
+        : `LLM Judge: score ${judge.fault_score.toFixed(2)} — "${judge.reasoning}"`
+
+      d1Explanation = judge.fault_score >= 0.8
+        ? `Agent correctly identified ${kbFault}. LLM judge confirms strong semantic alignment (score=${judge.fault_score.toFixed(2)}). KB derives this from threshold analysis of ${sensorResult.breachedSensors.join(', ')}.`
+        : judge.fault_score >= 0.5
+        ? `Agent partially identified ${kbFault}. LLM judge gives moderate semantic alignment (score=${judge.fault_score.toFixed(2)}). "${judge.reasoning}"`
+        : judge.wrong_fault
+        ? `SEMANTIC DRIFT (WRONG FAULT): KB determines fault = ${kbFault} but LLM judge detected agent identified ${judge.wrong_fault_name || 'a different fault'}. Score=${judge.fault_score.toFixed(2)}. "${judge.reasoning}"`
+        : `SEMANTIC DRIFT: KB determines fault = ${kbFault} from sensor breaches on [${sensorResult.breachedSensors.join(', ')}]. LLM judge scored agent output at ${judge.fault_score.toFixed(2)} — insufficient semantic alignment. "${judge.reasoning}"`
+    }
+  }
+
+  // Fallback to v1 keyword matching if LLM judge was not used or failed
+  if (!d1JudgeUsed) {
+    const faultTerms = KB.faultDetect[kbFault] || []
+    const foundFault = detectTerms(lower, faultTerms)
+    d1Passed         = foundFault.length > 0
+    d1Score          = d1Passed ? 1.0 : 0.0
+
+    d1AgentClaim = d1Passed
+      ? `Agent used KB-aligned terms: "${foundFault.join('", "')}" (keyword fallback)`
+      : `No KB fault vocabulary found in agent output (keyword fallback)`
+
+    d1Explanation = d1Passed
+      ? `Agent correctly identified ${kbFault}. KB derives this from threshold analysis of ${sensorResult.breachedSensors.join(', ')}. (Scored by keyword fallback)`
+      : `SEMANTIC DRIFT: KB determines fault = ${kbFault} from sensor threshold breaches on [${sensorResult.breachedSensors.join(', ')}]. Agent output did not contain KB-aligned fault vocabulary. Expected one of: [${faultTerms.join(', ')}]. (Scored by keyword fallback — LLM judge unavailable)`
+  }
 
   const d1 = {
     driftType:   'semantic',
     id:          'D1',
     name:        'Fault Mode Identification',
+    score:       d1Score,           // ── V2 CHANGE: graduated 0.0–1.0 score
     kbFact:      `KB computes fault = ${kbFault} from ${sensorResult.breachedCount} threshold breach(es) on: ${sensorResult.breachedSensors.join(', ')} [NASA TM-2008-215546]`,
-    agentClaim:  d1Passed ? `Agent used KB-aligned terms: "${foundFault.join('", "')}"` : `No KB fault vocabulary found in agent output`,
+    agentClaim:  d1AgentClaim,
     passed:      d1Passed,
     source:      'NASA TM-2008-215546 + ISO 13379-1',
-    explanation: d1Passed
-      ? `Agent correctly identified ${kbFault}. KB derives this from threshold analysis of ${sensorResult.breachedSensors.join(', ')}.`
-      : `SEMANTIC DRIFT: KB determines fault = ${kbFault} from sensor threshold breaches on [${sensorResult.breachedSensors.join(', ')}]. Agent output did not contain KB-aligned fault vocabulary. Expected one of: [${faultTerms.join(', ')}]. This suggests the agent did not ground its diagnosis in the KB threshold criteria.`,
+    explanation: d1Explanation,
+    judgeUsed:   d1JudgeUsed,       // ── V2 NEW: flag whether LLM judge was used
+    wrongFault:  d1WrongFault,      // ── V2 NEW: name of wrong fault if detected
   }
 
   // ── D2: Severity / Priority Level ─────────────────────────────────────────
+  // ── V2: UNCHANGED ─────────────────────────────────────────────────────────
   const priorityTerms  = KB.priorityDetect[kbPriObj.priority] || []
   const foundPriority  = detectTerms(lower, priorityTerms)
   const d2Passed       = foundPriority.length > 0
@@ -198,6 +371,7 @@ export function validateDiagnosisStep(engine, diagText) {
   }
 
   // ── D3: Sensor Evidence Citation ──────────────────────────────────────────
+  // ── V2: UNCHANGED ─────────────────────────────────────────────────────────
   const breachedSensors = sensorResult.checks.filter(c => c.breached)
   const citedSensors    = breachedSensors.filter(c =>
     lower.includes(c.sensor) || lower.includes(String(c.value))
@@ -235,6 +409,7 @@ export function validateDiagnosisStep(engine, diagText) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // STEP 3 — MAINTENANCE AGENT VALIDATION
 // Checks: correct procedure, agent-to-agent handoff, safety escalation.
+// ── V2: UNCHANGED ──────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export function validateMaintenanceStep(engine, diagText, maintText, kbFault, kbPriorityObj) {
@@ -301,6 +476,8 @@ export function validateMaintenanceStep(engine, diagText, maintText, kbFault, kb
 // Agent 2 ASI = C_sem
 // Agent 3 ASI = 0.50 × Semantic + 0.50 × Coordination
 // Overall ASI = (Agent2 ASI + Agent3 ASI) / 2
+//
+// ── V2: UNCHANGED ──────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Agent 2 — only Semantic Drift applies (no prior agent to coordinate with, no escalation obligation)
@@ -365,6 +542,7 @@ function scoreAgent3(kbFault, kbPriority, diagLower, maintLower) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MEMORY — localStorage run history (persists across sessions)
+// ── V2: UNCHANGED ──────────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const MEMORY_KEY            = 'cmapss_drift_memory'
@@ -399,9 +577,13 @@ export function getAllMemory() {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MAIN EXPORT — Full ASI validation with per-step results
+//
+// ── V2 CHANGE: This function is now ASYNC ──────────────────────────────────
+// because validateDiagnosisStep is now async (LLM judge call).
+// apiKey parameter added.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export function validateDrift(engine, diagnosisText, maintenanceText) {
+export async function validateDrift(apiKey, engine, diagnosisText, maintenanceText) {
   const rul           = engine.rul
   const kbPriorityObj = getKBPriority(rul)
   const sensorStep    = validateSensorStep(engine)
@@ -411,7 +593,8 @@ export function validateDrift(engine, diagnosisText, maintenanceText) {
   const maintLower = (maintenanceText || '').toLowerCase()
   const combined   = diagLower + ' ' + maintLower
 
-  const diagStep  = validateDiagnosisStep(engine, diagnosisText)
+  // ── V2 CHANGE: await the now-async diagnosis step ────────────────────────
+  const diagStep  = await validateDiagnosisStep(apiKey, engine, diagnosisText)
   const maintStep = validateMaintenanceStep(engine, diagnosisText, maintenanceText, kbFault, kbPriorityObj)
 
   const agent2 = scoreAgent2(kbFault, diagLower)
